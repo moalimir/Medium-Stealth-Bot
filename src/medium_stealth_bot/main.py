@@ -1,4 +1,6 @@
 import asyncio
+import json
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -10,6 +12,7 @@ from rich.table import Table
 from structlog import contextvars as structlog_contextvars
 from typer.models import OptionInfo
 
+from medium_stealth_bot import operations
 from medium_stealth_bot import __version__
 from medium_stealth_bot.artifact_schema import validate_artifact_payload
 from medium_stealth_bot.auth import (
@@ -17,6 +20,7 @@ from medium_stealth_bot.auth import (
     interactive_auth,
     upsert_env_file,
 )
+from medium_stealth_bot.browser_runtime import parse_cookie_header
 from medium_stealth_bot.client import MediumAsyncClient
 from medium_stealth_bot.contracts import ContractValidationReport, validate_contract_registry
 from medium_stealth_bot.database import Database
@@ -166,8 +170,10 @@ _OBSERVABILITY_MENU_OPTIONS: tuple[tuple[str, str, str], ...] = (
 _SETTINGS_MENU_OPTIONS: tuple[tuple[str, str, str], ...] = (
     ("1", "Config", "Edit start-menu defaults"),
     ("2", "Setup", "Run setup wizard"),
-    ("3", "Auth", "Refresh auth session"),
-    ("4", "Back", "Return to the start sections"),
+    ("3", "Auth", "Refresh auth session in browser"),
+    ("4", "Import", "Paste cookies from an already signed-in browser"),
+    ("5", "Check", "Inspect and verify current auth session"),
+    ("6", "Back", "Return to the start sections"),
 )
 _CANONICAL_GROWTH_POLICIES: tuple[GrowthPolicy, ...] = (
     GrowthPolicy.FOLLOW_ONLY,
@@ -467,6 +473,120 @@ def _render_auth(material: AuthSessionMaterial) -> None:
     console.print(table)
 
 
+def _profile_cookie_names(profile_dir: Path) -> list[str]:
+    cookie_db = profile_dir / "Default" / "Cookies"
+    if not cookie_db.exists():
+        return []
+    try:
+        with sqlite3.connect(f"file:{cookie_db}?mode=ro", uri=True, timeout=1.0) as connection:
+            rows = connection.execute(
+                "select distinct name from cookies where host_key like ? order by name",
+                ("%medium.com%",),
+            ).fetchall()
+    except sqlite3.Error:
+        return []
+    return [str(row[0]) for row in rows if row and row[0]]
+
+
+def _render_auth_status(settings: AppSettings) -> None:
+    cookie_map = parse_cookie_header(settings.medium_session or "")
+    profile_cookies = _profile_cookie_names(settings.playwright_profile_dir)
+    has_base_cookies = "sid" in cookie_map and "uid" in cookie_map and (
+        "xsrf" in cookie_map or "XSRF-TOKEN" in cookie_map
+    )
+    table = Table(title="Auth Status")
+    table.add_column("Check")
+    table.add_column("Value")
+    table.add_row("Session Configured", "true" if settings.has_session else "false")
+    table.add_row("CSRF Configured", "true" if bool(settings.medium_csrf) else "false")
+    table.add_row("User Ref Configured", "true" if bool(settings.medium_user_ref) else "false")
+    table.add_row("Client Mode", settings.client_mode)
+    table.add_row("Auth Browser", settings.playwright_auth_browser_channel)
+    table.add_row("Runtime Headless", "true" if settings.playwright_headless else "false")
+    table.add_row("Session Cookie Names", ", ".join(sorted(cookie_map)) or "-")
+    table.add_row("Profile Cookie Names", ", ".join(profile_cookies) or "-")
+    table.add_row("Has sid/uid/xsrf", "true" if has_base_cookies else "false")
+    table.add_row(
+        "Has Challenge Cookie",
+        "true"
+        if ("cf_clearance" in cookie_map or "_cfuvid" in cookie_map or "cf_clearance" in profile_cookies)
+        else "false",
+    )
+    console.print(table)
+
+
+def _auth_read_result_text(raw: Any) -> str:
+    try:
+        return json.dumps(raw, sort_keys=True, default=str).lower()
+    except TypeError:
+        return str(raw).lower()
+
+
+def _auth_read_failure_hint(*, settings: AppSettings, status_code: int, raw: Any) -> str:
+    raw_text = _auth_read_result_text(raw)
+    if status_code in settings.challenge_status_codes or any(token in raw_text for token in settings.challenge_tokens):
+        return "challenge_detected: refresh auth in a visible browser, complete any Medium/Cloudflare challenge, then verify again."
+    if status_code in settings.session_expiry_status_codes or any(
+        token in raw_text for token in settings.session_expiry_tokens
+    ):
+        return "session_expired: refresh or import a signed-in Medium cookie header."
+    if status_code != 200:
+        return f"unexpected_status_{status_code}: inspect latest response headers/logs."
+    return "graphql_errors: session reached Medium, but the validation read returned GraphQL errors."
+
+
+async def _run_auth_read_check(settings: AppSettings) -> tuple[bool, dict[str, Any]]:
+    operation = (
+        operations.user_viewer_edge(settings.medium_user_ref)
+        if settings.medium_user_ref
+        else operations.use_base_cache_control()
+    )
+    async with MediumAsyncClient(settings) as client:
+        result = await client.execute(operation)
+        ok = result.status_code == 200 and not result.has_errors
+        detail: dict[str, Any] = {
+            "operation": result.operation_name,
+            "status_code": result.status_code,
+            "error_count": len(result.errors),
+            "client_metrics": client.metrics_snapshot(),
+            "hint": None if ok else _auth_read_failure_hint(settings=settings, status_code=result.status_code, raw=result.raw),
+        }
+        return ok, detail
+
+
+def _render_auth_read_check(detail: dict[str, Any]) -> None:
+    table = Table(title="Auth Read Check")
+    table.add_column("Check")
+    table.add_column("Value")
+    table.add_row("Operation", str(detail.get("operation", "-")))
+    table.add_row("Status Code", str(detail.get("status_code", "-")))
+    table.add_row("GraphQL Errors", str(detail.get("error_count", "-")))
+    hint = detail.get("hint")
+    if hint:
+        table.add_row("Hint", str(hint))
+    console.print(table)
+    client_metrics = detail.get("client_metrics")
+    if isinstance(client_metrics, dict):
+        _render_client_health(client_metrics)
+
+
+def _verify_auth_read(settings: AppSettings) -> bool:
+    if not settings.has_session:
+        _print_notice("No MEDIUM_SESSION configured.", level="error")
+        return False
+    try:
+        ok, detail = asyncio.run(_run_auth_read_check(settings))
+    except Exception as exc:  # noqa: BLE001
+        _print_notice(f"Auth read check failed before a GraphQL response: {exc}", level="error")
+        return False
+    _render_auth_read_check(detail)
+    _print_notice(
+        "Auth read check passed." if ok else "Auth read check failed.",
+        level="success" if ok else "error",
+    )
+    return ok
+
+
 def _render_probe(snapshot: ProbeSnapshot) -> None:
     table = Table(title=f"Probe Results ({snapshot.tag_slug})")
     table.add_column("Task")
@@ -526,199 +646,281 @@ def _render_db_hygiene_status(result: dict[str, int | bool], *, mode: str) -> No
     console.print(table)
 
 
-def _render_daily_run(outcome: DailyRunOutcome) -> None:
-    mode_label = "dry-run" if outcome.dry_run else "live"
+_ACTION_LABELS: dict[str, str] = {
+    "follow_subscribe_attempt": "Follow",
+    "clap_pre_follow": "Clap",
+    "comment_pre_follow": "Comment",
+    "highlight_pre_follow": "Highlight",
+    "cleanup_unfollow": "Unfollow",
+}
+_GROWTH_BUDGET_ACTIONS = (
+    "follow_subscribe_attempt",
+    "clap_pre_follow",
+    "comment_pre_follow",
+    "highlight_pre_follow",
+)
+_CLEANUP_BUDGET_ACTIONS = ("cleanup_unfollow",)
 
-    if outcome.budget_exhausted:
-        _print_notice(
-            f"Daily budget exhausted (UTC day): {outcome.actions_today}/{outcome.max_actions_per_day}.",
-            level="warning",
-        )
+
+def _int_or_dash(value: Any) -> str:
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return str(int(value)) if value.is_integer() else str(round(value, 4))
+    if value is None:
+        return "-"
+    return str(value)
+
+
+def _metric_int(data: dict[str, Any], key: str, default: int = 0) -> int:
+    value = data.get(key)
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    return default
+
+
+def _render_rows_table(title: str, rows: list[tuple[str, Any]], *, key_column: str = "Metric") -> None:
+    table = Table(title=title)
+    table.add_column(key_column)
+    table.add_column("Value")
+    for key, value in rows:
+        table.add_row(key, _int_or_dash(value))
+    console.print(table)
+
+
+def _render_run_artifact_footer(artifact_path: Path | None) -> None:
+    if artifact_path is not None:
+        _print_notice(f"Run artifact saved: {artifact_path}", level="success")
+
+
+def _render_result_counts(counts: dict[str, int], *, title: str = "Decision Results") -> None:
+    if not counts:
         return
-    _print_notice(
-        f"Daily budget check passed (UTC day): {outcome.actions_today}/{outcome.max_actions_per_day} (mode={mode_label}).",
-        level="success",
-    )
-    summary_table = Table(title="Daily Cycle Summary")
-    summary_table.add_column("Metric")
-    summary_table.add_column("Value")
-    summary_table.add_row("Mode", mode_label)
-    if outcome.growth_policy is not None:
-        summary_table.add_row("Growth Policy", _format_growth_policy(outcome.growth_policy))
-    if outcome.growth_sources:
-        summary_table.add_row("Growth Sources", _format_growth_sources(outcome.growth_sources))
-    if outcome.target_user_refs:
-        summary_table.add_row("Target Users", _seed_refs_summary(outcome.target_user_refs))
-    if outcome.target_user_scan_limit is not None:
-        summary_table.add_row("Target User Scan Limit", str(outcome.target_user_scan_limit))
-    if outcome.session_passes > 1 or outcome.session_stop_reason:
-        summary_table.add_row("Session Passes", str(outcome.session_passes))
-        summary_table.add_row("Session Elapsed (s)", str(round(outcome.session_elapsed_seconds, 3)))
-        summary_table.add_row("Session Stop Reason", outcome.session_stop_reason or "-")
-        summary_table.add_row("Session Target Follows", str(outcome.session_target_follow_attempts or "-"))
-        session_min_follows = outcome.kpis.get("session_target_follow_attempts_min")
-        summary_table.add_row(
-            "Session Min Follows",
-            str(int(session_min_follows)) if isinstance(session_min_follows, (int, float)) else "-",
-        )
-        summary_table.add_row("Session Target Duration (m)", str(outcome.session_target_duration_minutes or "-"))
-    queue_ready = outcome.kpis.get("growth_queue_ready")
-    queue_deferred = outcome.kpis.get("growth_queue_deferred")
-    if all(isinstance(value, (int, float)) for value in (queue_ready, queue_deferred)):
-        summary_table.add_row(
-            "Queue Ready/Deferred",
-            f"{int(queue_ready)} / {int(queue_deferred)}",
-        )
-    discovery_enabled_value = outcome.kpis.get("growth_discovery_enabled")
-    discovery_enabled = (
-        bool(discovery_enabled_value)
-        if isinstance(discovery_enabled_value, (int, float))
-        else bool(outcome.discovered_candidates)
-    )
-    if discovery_enabled:
-        summary_table.add_row(
-            "Discovered / Queued",
-            f"{outcome.discovered_candidates} / {outcome.screened_candidates}",
-        )
-        summary_table.add_row(
-            "Queued / Execution-Ready",
-            f"{outcome.screened_candidates} / {outcome.eligible_candidates}",
-        )
+    table = Table(title=title)
+    table.add_column("Result")
+    table.add_column("Count", justify="right")
+    for result, count in sorted(counts.items()):
+        table.add_row(_format_metric_key(result), str(count))
+    console.print(table)
+
+
+def _render_reason_counts(
+    counts: dict[str, int],
+    *,
+    title: str = "Top Decision Reasons",
+    limit: int = 8,
+    prefixes: tuple[str, ...] | None = None,
+) -> None:
+    if prefixes:
+        filtered = {key: value for key, value in counts.items() if key.startswith(prefixes)}
     else:
-        summary_table.add_row(
-            "Queue Fetched / Selected",
-            f"{outcome.screened_candidates} / {outcome.eligible_candidates}",
+        filtered = dict(counts)
+    if not filtered:
+        return
+    table = Table(title=title)
+    table.add_column("Reason")
+    table.add_column("Count", justify="right")
+    ordered = sorted(filtered.items(), key=lambda item: (-int(item[1]), str(item[0])))[:limit]
+    for reason, count in ordered:
+        table.add_row(reason, str(count))
+    console.print(table)
+
+
+def _render_action_budget(outcome: DailyRunOutcome, *, actions: tuple[str, ...], title: str = "Action Budget") -> None:
+    available_actions = [action for action in actions if action in outcome.action_counts_today]
+    if not available_actions:
+        return
+    table = Table(title=title)
+    table.add_column("Action")
+    table.add_column("Used", justify="right")
+    table.add_column("Limit", justify="right")
+    table.add_column("Remaining", justify="right")
+    for action_name in available_actions:
+        table.add_row(
+            _ACTION_LABELS.get(action_name, _format_metric_key(action_name)),
+            str(outcome.action_counts_today.get(action_name, 0)),
+            str(outcome.action_limits_per_day.get(action_name, 0)),
+            str(outcome.action_remaining_per_day.get(action_name, 0)),
         )
-    summary_table.add_row(
-        "Executed / Followed",
-        f"{outcome.executed_candidates} / {outcome.followed_candidates}",
+    console.print(table)
+
+
+def _render_client_health(metrics: dict[str, Any]) -> None:
+    if not metrics:
+        return
+    status_counts = metrics.get("status_counts")
+    rows = [
+        ("Mode", metrics.get("mode", "-")),
+        ("Requests", metrics.get("request_count", 0)),
+        ("Failures", metrics.get("result_failures", 0)),
+        ("Avg Latency (ms)", metrics.get("avg_latency_ms", "-")),
+        ("Last Status", metrics.get("last_status_code", "-")),
+    ]
+    _render_rows_table("Client Health", rows)
+    if isinstance(status_counts, dict) and status_counts:
+        _render_mapping_table(
+            title="HTTP Status Counts",
+            data={str(key): value for key, value in status_counts.items()},
+            key_column="Status",
+            value_column="Count",
+        )
+
+
+def _render_source_discovery_breakdown(
+    *,
+    discovered_by_source: dict[str, int],
+    queued_by_source: dict[str, int],
+    verified_by_source: dict[str, int] | None = None,
+    title: str = "Source Breakdown",
+) -> None:
+    sources = sorted(set(discovered_by_source) | set(queued_by_source) | set(verified_by_source or {}))
+    if not sources:
+        return
+    table = Table(title=title)
+    table.add_column("Source")
+    table.add_column("Discovered", justify="right")
+    table.add_column("Queued/Eligible", justify="right")
+    if verified_by_source:
+        table.add_column("Verified Follows", justify="right")
+    for source in sources:
+        row = [
+            _format_growth_source(source),
+            str(discovered_by_source.get(source, 0)),
+            str(queued_by_source.get(source, 0)),
+        ]
+        if verified_by_source:
+            row.append(str(verified_by_source.get(source, 0)))
+        table.add_row(*row)
+    console.print(table)
+
+
+def _discovered_source_counts_from_kpis(kpis: dict[str, Any]) -> dict[str, int]:
+    prefix = "growth_discovery_source_candidates__"
+    return {
+        key.removeprefix(prefix): int(value)
+        for key, value in kpis.items()
+        if key.startswith(prefix) and isinstance(value, (int, float)) and not isinstance(value, bool)
+    }
+
+
+def _render_discovery_report(
+    outcome: DailyRunOutcome,
+    *,
+    tag_slug: str,
+    artifact_path: Path | None = None,
+) -> None:
+    mode_label = "dry-run" if outcome.dry_run else "live"
+    context_rows = [
+        ("Mode", mode_label),
+        ("Tag", tag_slug),
+        ("Growth Sources", _format_growth_sources(outcome.growth_sources)),
+        ("Target Users", _seed_refs_summary(outcome.target_user_refs)),
+        ("Target User Scan Limit", outcome.target_user_scan_limit),
+    ]
+    _render_rows_table("Discovery Report", context_rows)
+
+    kpis = outcome.kpis
+    queued = _metric_int(kpis, "growth_queue_discovery_enqueued", outcome.screened_candidates)
+    _render_rows_table(
+        "Discovery Funnel",
+        [
+            ("Discovered", outcome.discovered_candidates),
+            ("Queued This Run", queued),
+            ("Execution Ready", outcome.eligible_candidates),
+            ("Queue Ready Before", kpis.get("growth_queue_ready_before_discovery", "-")),
+            ("Queue Ready After", kpis.get("growth_queue_ready_after_discovery", "-")),
+            ("Queue Capacity Before", kpis.get("growth_queue_capacity_before_discovery", "-")),
+            ("Candidate DB Cap", kpis.get("growth_queue_candidate_cap", "-")),
+        ],
     )
-    summary_table.add_row(
-        "Follow Attempted / Verified",
-        f"{outcome.follow_actions_attempted} / {outcome.follow_actions_verified}",
+    _render_result_counts(outcome.decision_result_counts)
+    _render_reason_counts(outcome.decision_reason_counts, title="Top Skip Reasons", prefixes=("skip:",))
+    _render_source_discovery_breakdown(
+        discovered_by_source=_discovered_source_counts_from_kpis(kpis),
+        queued_by_source=outcome.source_candidate_counts,
     )
-    summary_table.add_row(
-        "Clap Attempted / Verified",
-        f"{outcome.clap_actions_attempted} / {outcome.clap_actions_verified}",
+    _render_client_health(outcome.client_metrics)
+    _render_run_artifact_footer(artifact_path)
+
+
+def _render_growth_report(
+    outcome: DailyRunOutcome,
+    *,
+    tag_slug: str,
+    artifact_path: Path | None = None,
+) -> None:
+    mode_label = "dry-run" if outcome.dry_run else "live"
+    rows = [
+        ("Mode", mode_label),
+        ("Tag", tag_slug),
+        ("Growth Policy", _format_growth_policy(outcome.growth_policy)),
+    ]
+    if outcome.session_passes > 1 or outcome.session_stop_reason:
+        rows.extend(
+            [
+                ("Session Passes", outcome.session_passes),
+                ("Session Stop Reason", outcome.session_stop_reason or "-"),
+                ("Session Elapsed (s)", round(outcome.session_elapsed_seconds, 3)),
+                ("Session Target Follows", outcome.session_target_follow_attempts or "-"),
+            ]
+        )
+    _render_rows_table("Growth Report", rows)
+
+    _render_rows_table(
+        "Execution Funnel",
+        [
+            ("Queue Fetched", outcome.screened_candidates),
+            ("Eligible", outcome.eligible_candidates),
+            ("Executed", outcome.executed_candidates),
+            ("Follow Attempted / Verified", f"{outcome.follow_actions_attempted} / {outcome.follow_actions_verified}"),
+            ("Clap Attempted / Verified", f"{outcome.clap_actions_attempted} / {outcome.clap_actions_verified}"),
+            ("Comment Attempted / Verified", f"{outcome.comment_actions_attempted} / {outcome.comment_actions_verified}"),
+            ("Highlight Attempted / Verified", f"{outcome.highlight_actions_attempted} / {outcome.highlight_actions_verified}"),
+        ],
     )
-    if (
-        outcome.growth_policy in {GrowthPolicy.WARM_ENGAGE_COMMENT, GrowthPolicy.WARM_ENGAGE_HIGHLIGHT}
-        or outcome.public_touch_actions_attempted > 0
-        or outcome.public_touch_actions_verified > 0
-    ):
-        summary_table.add_row(
-            "Public Touch Attempted / Verified",
-            f"{outcome.public_touch_actions_attempted} / {outcome.public_touch_actions_verified}",
-        )
-    if (
-        outcome.growth_policy == GrowthPolicy.WARM_ENGAGE_COMMENT
-        or outcome.comment_actions_attempted > 0
-        or outcome.comment_actions_verified > 0
-    ):
-        summary_table.add_row(
-            "Comment Attempted / Verified",
-            f"{outcome.comment_actions_attempted} / {outcome.comment_actions_verified}",
-        )
-    if (
-        outcome.growth_policy == GrowthPolicy.WARM_ENGAGE_HIGHLIGHT
-        or outcome.highlight_actions_attempted > 0
-        or outcome.highlight_actions_verified > 0
-    ):
-        summary_table.add_row(
-            "Highlight Attempted / Verified",
-            f"{outcome.highlight_actions_attempted} / {outcome.highlight_actions_verified}",
-        )
-    if outcome.cleanup_only_mode or outcome.cleanup_actions_attempted > 0 or outcome.cleanup_actions_verified > 0:
-        summary_table.add_row(
-            "Cleanup Attempted / Verified",
-            f"{outcome.cleanup_actions_attempted} / {outcome.cleanup_actions_verified}",
-        )
-    console.print(summary_table)
-
-    if outcome.decision_result_counts:
-        result_table = Table(title="Decision Result Counts")
-        result_table.add_column("Result")
-        result_table.add_column("Count")
-        for result, count in sorted(outcome.decision_result_counts.items()):
-            result_table.add_row(result, str(count))
-        console.print(result_table)
-
-    if outcome.action_counts_today:
-        budget_table = Table(title="Per-Action Daily Budget")
-        budget_table.add_column("Action")
-        budget_table.add_column("Used")
-        budget_table.add_column("Limit")
-        budget_table.add_column("Remaining")
-        for action_name, used in sorted(outcome.action_counts_today.items()):
-            limit = outcome.action_limits_per_day.get(action_name, 0)
-            remaining = outcome.action_remaining_per_day.get(action_name, 0)
-            budget_table.add_row(action_name, str(used), str(limit), str(remaining))
-        console.print(budget_table)
-
-    if outcome.kpis:
-        kpi_table = Table(title="KPI Summary")
-        kpi_table.add_column("KPI")
-        kpi_table.add_column("Value")
-        for key, value in sorted(outcome.kpis.items()):
-            kpi_table.add_row(_format_metric_key(key), str(value))
-        console.print(kpi_table)
-
-    if outcome.client_metrics:
-        metrics = dict(outcome.client_metrics)
-        status_counts = metrics.pop("status_counts", None)
-        metrics_table = Table(title="Client Metrics")
-        metrics_table.add_column("Metric")
-        metrics_table.add_column("Value")
-        for key, value in sorted(metrics.items()):
-            metrics_table.add_row(_format_metric_key(key), str(value))
-        console.print(metrics_table)
-        if isinstance(status_counts, dict) and status_counts:
-            _render_mapping_table(
-                title="Client HTTP Status Counts",
-                data={str(key): value for key, value in status_counts.items()},
-                key_column="Status",
-                value_column="Count",
-            )
-
+    _render_action_budget(outcome, actions=_GROWTH_BUDGET_ACTIONS)
+    _render_result_counts(outcome.decision_result_counts)
+    _render_reason_counts(outcome.decision_reason_counts)
     if outcome.source_candidate_counts:
-        source_table = Table(title="Source Screened Candidate Counts")
-        source_table.add_column("Source")
-        source_table.add_column("Candidates")
-        source_table.add_column("Verified Follows")
-        for source, count in sorted(outcome.source_candidate_counts.items()):
-            source_table.add_row(
-                source,
-                str(count),
-                str(outcome.source_follow_verified_counts.get(source, 0)),
-            )
-        console.print(source_table)
-
-    if outcome.conversion_by_source:
-        _render_mapping_table(
-            title="Followback Conversion By Source",
-            data=outcome.conversion_by_source,
-            key_column="Source",
-            value_column="Metrics",
+        _render_source_discovery_breakdown(
+            discovered_by_source={},
+            queued_by_source=outcome.source_candidate_counts,
+            verified_by_source=outcome.source_follow_verified_counts,
+            title="Execution Sources",
         )
+    _render_client_health(outcome.client_metrics)
+    _render_run_artifact_footer(artifact_path)
 
-    if outcome.conversion_by_policy:
-        _render_mapping_table(
-            title="Followback Conversion By Policy",
-            data=outcome.conversion_by_policy,
-            key_column="Policy",
-            value_column="Metrics",
-        )
 
-    if outcome.decision_log:
-        table = Table(title="Decision Log (sample)")
-        table.add_column("#")
-        table.add_column("Decision")
-        for idx, item in enumerate(outcome.decision_log[:12], start=1):
-            table.add_row(str(idx), item)
-        console.print(table)
-
-    if outcome.probe:
-        _render_probe(outcome.probe)
+def _render_cleanup_report(
+    outcome: DailyRunOutcome,
+    *,
+    limit: int | None = None,
+    artifact_path: Path | None = None,
+) -> None:
+    mode_label = "dry-run" if outcome.dry_run else "live"
+    _render_rows_table(
+        "Cleanup Report",
+        [
+            ("Mode", mode_label),
+            ("Run Limit", limit if limit is not None else "-"),
+            ("Unfollow Attempted / Verified", f"{outcome.cleanup_actions_attempted} / {outcome.cleanup_actions_verified}"),
+            ("Daily Actions Used", f"{outcome.actions_today} / {outcome.max_actions_per_day}"),
+        ],
+    )
+    _render_action_budget(outcome, actions=_CLEANUP_BUDGET_ACTIONS)
+    _render_result_counts(outcome.decision_result_counts)
+    _render_reason_counts(
+        outcome.decision_reason_counts,
+        title="Cleanup Decisions",
+        prefixes=("cleanup:", "skip:", "dry_run:"),
+    )
+    _render_client_health(outcome.client_metrics)
+    _render_run_artifact_footer(artifact_path)
 
 
 def _render_reconcile_outcome(outcome: ReconcileOutcome) -> None:
@@ -983,241 +1185,193 @@ def _build_standard_artifact_payload(
     return payload
 
 
-def _render_status(artifact: dict, *, artifact_path: Path, settings: AppSettings | None = None) -> None:
+def _artifact_mode_label(artifact: dict[str, Any]) -> str:
     dry_run = artifact.get("dry_run")
-    mode = "dry-run" if dry_run is True else "live" if dry_run is False else "-"
-    table = Table(title="Last Run Health")
-    table.add_column("Field")
-    table.add_column("Value")
-    table.add_row("Run ID", str(artifact.get("run_id", "-")))
-    table.add_row("Status", str(artifact.get("status", "-")))
-    table.add_row("Health", str(artifact.get("health", "-")))
-    table.add_row("Tag", str(artifact.get("tag_slug", "-")))
-    table.add_row("Mode", mode)
-    table.add_row("Started", str(artifact.get("started_at", "-")))
-    table.add_row("Ended", str(artifact.get("ended_at", "-")))
-    table.add_row("Duration (ms)", str(artifact.get("duration_ms", "-")))
-    table.add_row("Artifact", str(artifact_path))
-    console.print(table)
+    return "dry-run" if dry_run is True else "live" if dry_run is False else "-"
 
-    summary = artifact.get("summary")
-    if isinstance(summary, dict) and summary:
-        summary_table = Table(title="Run Summary")
-        summary_table.add_column("Metric")
-        summary_table.add_column("Value")
-        for key in (
-            "budget_exhausted",
-            "actions_today",
-            "max_actions_per_day",
-            "growth_policy",
-            "growth_sources",
-            "growth_mode",
-            "discovery_mode",
-            "target_user_refs",
-            "target_user_scan_limit",
-            "session_passes",
-            "session_elapsed_seconds",
-            "session_stop_reason",
-            "session_target_follow_attempts",
-            "session_target_duration_minutes",
-            "discovered_candidates",
-            "screened_candidates",
-            "executed_candidates",
-            "followed_candidates",
-            "considered_candidates",
-            "eligible_candidates",
-            "follow_actions_attempted",
-            "follow_actions_verified",
-            "clap_actions_attempted",
-            "clap_actions_verified",
-            "public_touch_actions_attempted",
-            "public_touch_actions_verified",
-            "comment_actions_attempted",
-            "comment_actions_verified",
-            "highlight_actions_attempted",
-            "highlight_actions_verified",
-            "cleanup_actions_attempted",
-            "cleanup_actions_verified",
-        ):
-            if key in summary:
-                value = summary[key]
-                if key == "growth_sources" and isinstance(value, list):
-                    rendered_value = _format_growth_sources([str(item) for item in value])
-                elif key == "growth_policy":
-                    rendered_value = _format_growth_policy(str(value))
-                elif key == "growth_mode":
-                    rendered_value = _format_growth_mode(str(value))
-                elif key == "discovery_mode":
-                    rendered_value = _format_discovery_mode(str(value))
-                elif key == "target_user_refs" and isinstance(value, list):
-                    rendered_value = _seed_refs_summary([str(item) for item in value])
-                else:
-                    rendered_value = str(value)
-                summary_table.add_row(_format_metric_key(key), rendered_value)
-        console.print(summary_table)
 
-    for title, key in (
-        ("Action Counts", "action_counts"),
-        ("Decision Result Counts", "result_counts"),
-        ("Decision Reason Counts", "reason_counts"),
-        ("KPI Summary", "kpis"),
-        ("Client Metrics", "client_metrics"),
-        ("Source Screened Candidate Counts", "source_candidate_counts"),
-        ("Source Verified Follow Counts", "source_follow_verified_counts"),
-        ("Policy Verified Follow Counts", "policy_follow_verified_counts"),
-        ("Followback Conversion By Source", "conversion_by_source"),
-        ("Followback Conversion By Policy", "conversion_by_policy"),
-    ):
-        data = artifact.get(key)
-        if isinstance(data, dict) and data:
-            if key == "kpis":
-                _render_mapping_table(
-                    title=title,
-                    data={_format_metric_key(str(item_key)): item_value for item_key, item_value in data.items()},
-                    key_column="KPI",
-                    value_column="Value",
-                )
-                continue
-            if key == "client_metrics":
-                metrics = dict(data)
-                status_counts = metrics.pop("status_counts", None)
-                _render_mapping_table(
-                    title=title,
-                    data={_format_metric_key(str(item_key)): item_value for item_key, item_value in metrics.items()},
-                    key_column="Metric",
-                    value_column="Value",
-                )
-                if isinstance(status_counts, dict) and status_counts:
-                    _render_mapping_table(
-                        title="Client HTTP Status Counts",
-                        data={str(item_key): item_value for item_key, item_value in status_counts.items()},
-                        key_column="Status",
-                        value_column="Count",
-                    )
-                continue
-            _render_mapping_table(title=title, data=data)
+def _artifact_dict(artifact: dict[str, Any], key: str) -> dict[str, Any]:
+    value = artifact.get(key)
+    return dict(value) if isinstance(value, dict) else {}
 
-    error = artifact.get("error")
-    if isinstance(error, dict) and error:
-        error_table = Table(title="Last Error")
-        error_table.add_column("Field")
-        error_table.add_column("Value")
-        for key in ("type", "message", "reason", "task_name", "detail"):
-            value = error.get(key)
-            if value is not None:
-                error_table.add_row(_format_metric_key(key), str(value))
-        console.print(error_table)
 
-    if settings is None:
+def _render_artifact_action_budget(artifact: dict[str, Any], *, actions: tuple[str, ...]) -> None:
+    action_counts = _artifact_dict(artifact, "action_counts")
+    if not action_counts:
         return
+    table = Table(title="Action Counts")
+    table.add_column("Action")
+    table.add_column("Used", justify="right")
+    for action_name in actions:
+        if action_name in action_counts:
+            table.add_row(
+                _ACTION_LABELS.get(action_name, _format_metric_key(action_name)),
+                str(action_counts.get(action_name, 0)),
+            )
+    if table.row_count:
+        console.print(table)
 
-    try:
-        _, repository = _build_runner(settings)
-        _render_growth_queue_status(
-            repository.growth_queue_state_counts(),
-            title="Growth Queue Control Panel",
+
+def _render_status_header(artifact: dict[str, Any], *, artifact_path: Path) -> None:
+    _render_rows_table(
+        "Last Run Health",
+        [
+            ("Command", artifact.get("command", "-")),
+            ("Run ID", artifact.get("run_id", "-")),
+            ("Status", artifact.get("status", "-")),
+            ("Health", artifact.get("health", "-")),
+            ("Mode", _artifact_mode_label(artifact)),
+            ("Started", artifact.get("started_at", "-")),
+            ("Ended", artifact.get("ended_at", "-")),
+            ("Duration (ms)", artifact.get("duration_ms", "-")),
+            ("Artifact", artifact_path),
+        ],
+        key_column="Field",
+    )
+
+
+def _render_status_discovery(artifact: dict[str, Any]) -> None:
+    summary = _artifact_dict(artifact, "summary")
+    kpis = _artifact_dict(artifact, "kpis")
+    target_refs = summary.get("target_user_refs")
+    growth_sources = summary.get("growth_sources")
+    _render_rows_table(
+        "Discovery Report",
+        [
+            ("Mode", _artifact_mode_label(artifact)),
+            ("Tag", artifact.get("tag_slug", "-")),
+            ("Growth Sources", _format_growth_sources([str(item) for item in growth_sources] if isinstance(growth_sources, list) else None)),
+            ("Target Users", _seed_refs_summary([str(item) for item in target_refs] if isinstance(target_refs, list) else [])),
+            ("Target User Scan Limit", summary.get("target_user_scan_limit")),
+        ],
+    )
+    _render_rows_table(
+        "Discovery Funnel",
+        [
+            ("Discovered", summary.get("discovered_candidates", 0)),
+            ("Queued This Run", kpis.get("growth_queue_discovery_enqueued", summary.get("screened_candidates", 0))),
+            ("Execution Ready", summary.get("eligible_candidates", 0)),
+            ("Queue Ready Before", kpis.get("growth_queue_ready_before_discovery", "-")),
+            ("Queue Ready After", kpis.get("growth_queue_ready_after_discovery", "-")),
+            ("Queue Capacity Before", kpis.get("growth_queue_capacity_before_discovery", "-")),
+            ("Candidate DB Cap", kpis.get("growth_queue_candidate_cap", "-")),
+        ],
+    )
+    _render_result_counts({str(key): int(value) for key, value in _artifact_dict(artifact, "result_counts").items()})
+    _render_reason_counts(
+        {str(key): int(value) for key, value in _artifact_dict(artifact, "reason_counts").items()},
+        title="Top Skip Reasons",
+        prefixes=("skip:",),
+    )
+    _render_source_discovery_breakdown(
+        discovered_by_source=_discovered_source_counts_from_kpis(kpis),
+        queued_by_source={str(key): int(value) for key, value in _artifact_dict(artifact, "source_candidate_counts").items()},
+    )
+    _render_client_health(_artifact_dict(artifact, "client_metrics"))
+
+
+def _render_status_growth(artifact: dict[str, Any]) -> None:
+    summary = _artifact_dict(artifact, "summary")
+    rows = [
+        ("Mode", _artifact_mode_label(artifact)),
+        ("Tag", artifact.get("tag_slug", "-")),
+        ("Growth Policy", _format_growth_policy(summary.get("growth_policy") or None)),
+    ]
+    if summary.get("session_passes") or summary.get("session_stop_reason"):
+        rows.extend(
+            [
+                ("Session Passes", summary.get("session_passes", "-")),
+                ("Session Stop Reason", summary.get("session_stop_reason") or "-"),
+                ("Session Elapsed (s)", summary.get("session_elapsed_seconds", "-")),
+                ("Session Target Follows", summary.get("session_target_follow_attempts", "-")),
+            ]
         )
-    except Exception as exc:  # noqa: BLE001
-        _print_notice(f"Failed to load queue status: {exc}", level="warning")
+    _render_rows_table("Growth Report", rows)
+    _render_rows_table(
+        "Execution Funnel",
+        [
+            ("Queue Fetched", summary.get("screened_candidates", 0)),
+            ("Eligible", summary.get("eligible_candidates", 0)),
+            ("Executed", summary.get("executed_candidates", 0)),
+            ("Follow Attempted / Verified", f"{summary.get('follow_actions_attempted', 0)} / {summary.get('follow_actions_verified', 0)}"),
+            ("Clap Attempted / Verified", f"{summary.get('clap_actions_attempted', 0)} / {summary.get('clap_actions_verified', 0)}"),
+            ("Comment Attempted / Verified", f"{summary.get('comment_actions_attempted', 0)} / {summary.get('comment_actions_verified', 0)}"),
+            ("Highlight Attempted / Verified", f"{summary.get('highlight_actions_attempted', 0)} / {summary.get('highlight_actions_verified', 0)}"),
+        ],
+    )
+    _render_artifact_action_budget(artifact, actions=_GROWTH_BUDGET_ACTIONS)
+    _render_result_counts({str(key): int(value) for key, value in _artifact_dict(artifact, "result_counts").items()})
+    _render_reason_counts({str(key): int(value) for key, value in _artifact_dict(artifact, "reason_counts").items()})
+    source_counts = {str(key): int(value) for key, value in _artifact_dict(artifact, "source_candidate_counts").items()}
+    if source_counts:
+        _render_source_discovery_breakdown(
+            discovered_by_source={},
+            queued_by_source=source_counts,
+            verified_by_source={str(key): int(value) for key, value in _artifact_dict(artifact, "source_follow_verified_counts").items()},
+            title="Execution Sources",
+        )
+    _render_client_health(_artifact_dict(artifact, "client_metrics"))
 
-    growth_defaults = Table(title="Configured Growth Defaults")
-    growth_defaults.add_column("Key")
-    growth_defaults.add_column("Value")
-    growth_defaults.add_row("Growth Policy", _format_growth_policy(settings.default_growth_policy))
-    growth_defaults.add_row("Growth Sources", _format_growth_sources(settings.default_growth_sources))
-    growth_defaults.add_row("Target-User Followers Scan Limit", str(settings.target_user_followers_scan_limit))
-    growth_defaults.add_row("Discovery Eligible / Run", str(settings.discovery_eligible_per_run))
-    growth_defaults.add_row("Growth Candidate DB Cap", str(settings.growth_candidate_queue_max_size))
-    growth_defaults.add_row("Follow Cooldown (h)", str(settings.follow_cooldown_hours))
-    growth_defaults.add_row(
-        "Candidate Followers Range",
-        f"{settings.candidate_min_followers}-{settings.candidate_max_followers if settings.candidate_max_followers > 0 else 'unbounded'}",
+
+def _render_status_cleanup(artifact: dict[str, Any]) -> None:
+    summary = _artifact_dict(artifact, "summary")
+    _render_rows_table(
+        "Cleanup Report",
+        [
+            ("Mode", _artifact_mode_label(artifact)),
+            ("Unfollow Attempted / Verified", f"{summary.get('cleanup_actions_attempted', 0)} / {summary.get('cleanup_actions_verified', 0)}"),
+            ("Daily Actions Used", f"{summary.get('actions_today', 0)} / {summary.get('max_actions_per_day', 0)}"),
+        ],
     )
-    growth_defaults.add_row(
-        "Candidate Following Range",
-        f"{settings.candidate_min_following}-{settings.candidate_max_following if settings.candidate_max_following > 0 else 'unbounded'}",
+    _render_artifact_action_budget(artifact, actions=_CLEANUP_BUDGET_ACTIONS)
+    _render_result_counts({str(key): int(value) for key, value in _artifact_dict(artifact, "result_counts").items()})
+    _render_reason_counts(
+        {str(key): int(value) for key, value in _artifact_dict(artifact, "reason_counts").items()},
+        title="Cleanup Decisions",
+        prefixes=("cleanup:", "skip:", "dry_run:"),
     )
-    growth_defaults.add_row("Max Following/Follower Ratio", str(settings.max_following_follower_ratio))
-    growth_defaults.add_row("Require Candidate Bio", "true" if settings.require_candidate_bio else "false")
-    growth_defaults.add_row("Require Candidate Latest Post", "true" if settings.require_candidate_latest_post else "false")
-    growth_defaults.add_row("Candidate Recent Activity (d)", str(settings.candidate_recent_activity_days))
-    growth_defaults.add_row("Discovery Followers Depth", str(settings.discovery_followers_depth))
-    growth_defaults.add_row("Discovery Seed Followers Limit", str(settings.discovery_seed_followers_limit))
-    growth_defaults.add_row("Discovery Second-Hop Seed Limit", str(settings.discovery_second_hop_seed_limit))
-    growth_defaults.add_row(
-        "Queue Buffer Target",
-        (
-            f"min={settings.growth_queue_buffer_target_min}, "
-            f"max={settings.growth_queue_buffer_target_max}, "
-            f"x{settings.growth_queue_buffer_target_multiplier}"
-        ),
-    )
-    growth_defaults.add_row(
-        "Queue Fetch Limit",
-        (
-            f"min={settings.growth_queue_fetch_limit_min}, "
-            f"max={settings.growth_queue_fetch_limit_max}, "
-            f"x{settings.growth_queue_fetch_limit_multiplier}"
-        ),
-    )
-    growth_defaults.add_row("Queue Due Deferred Reserve", str(round(settings.growth_queue_due_deferred_reserve_ratio, 3)))
-    growth_defaults.add_row(
-        "Queue Retry Started (s)",
-        (
-            f"floor={settings.growth_queue_retry_started_floor_seconds}, "
-            f"x{settings.growth_queue_retry_started_cooldown_multiplier}"
-        ),
-    )
-    growth_defaults.add_row(
-        "Queue Retry Short (s)",
-        f"floor={settings.growth_queue_retry_short_floor_seconds}, x{settings.growth_queue_retry_short_cooldown_multiplier}",
-    )
-    growth_defaults.add_row(
-        "Queue Retry Medium (s)",
-        f"floor={settings.growth_queue_retry_medium_floor_seconds}, x{settings.growth_queue_retry_medium_cooldown_multiplier}",
-    )
-    growth_defaults.add_row(
-        "Queue Retry Long (s)",
-        f"floor={settings.growth_queue_retry_long_floor_seconds}, x{settings.growth_queue_retry_long_cooldown_multiplier}",
-    )
-    growth_defaults.add_row(
-        "Queue Prune TTL (d)",
-        (
-            f"followed={settings.growth_queue_prune_followed_after_days}, "
-            f"rejected={settings.growth_queue_prune_rejected_after_days}, "
-            f"stale={settings.growth_queue_prune_stale_after_days}"
-        ),
-    )
-    growth_defaults.add_row(
-        "DB Hygiene TTL (d)",
-        (
-            f"action_log={settings.db_hygiene_action_log_retention_days}, "
-            f"graph_sync_runs={settings.db_hygiene_graph_sync_runs_retention_days}, "
-            f"candidate_reconciliation={settings.db_hygiene_candidate_reconciliation_retention_days}, "
-            f"follow_cycle={settings.db_hygiene_follow_cycle_terminal_retention_days}, "
-            f"snapshots={settings.db_hygiene_snapshots_retention_days}"
-        ),
-    )
-    growth_defaults.add_row("DB Hygiene Vacuum", "true" if settings.db_hygiene_vacuum_after_cleanup else "false")
-    growth_defaults.add_row("Pre-Follow Clap", "true" if settings.enable_pre_follow_clap else "false")
-    growth_defaults.add_row("Pre-Follow Comment", "true" if settings.enable_pre_follow_comment else "false")
-    growth_defaults.add_row("Pre-Follow Comment Probability", str(round(settings.pre_follow_comment_probability, 3)))
-    growth_defaults.add_row("Pre-Follow Highlight", "true" if settings.enable_pre_follow_highlight else "false")
-    growth_defaults.add_row("Pre-Follow Highlight Probability", str(round(settings.pre_follow_highlight_probability, 3)))
-    growth_defaults.add_row("Live Session Duration (m)", str(settings.live_session_duration_minutes))
-    growth_defaults.add_row("Live Session Target Follows", str(settings.live_session_target_follow_attempts))
-    growth_defaults.add_row("Live Session Min Follows", str(settings.live_session_min_follow_attempts))
-    growth_defaults.add_row("Live Session Max Passes", str(settings.live_session_max_passes))
-    growth_defaults.add_row("Max Follow Actions Per Cycle", str(settings.max_follow_actions_per_run))
-    growth_defaults.add_row("Max Subscribe Actions Per Day", str(settings.max_subscribe_actions_per_day))
-    growth_defaults.add_row("Max Comment Actions Per Day", str(settings.max_comment_actions_per_day))
-    growth_defaults.add_row("Max Highlight Actions Per Day", str(settings.max_highlight_actions_per_day))
-    growth_defaults.add_row("Max Mutations / 10m", str(settings.max_mutations_per_10_minutes))
-    growth_defaults.add_row("Verify Gap (s)", f"{settings.min_verify_gap_seconds}-{settings.max_verify_gap_seconds}")
-    growth_defaults.add_row("Pass Cooldown (s)", f"{settings.pass_cooldown_min_seconds}-{settings.pass_cooldown_max_seconds}")
-    growth_defaults.add_row("Soft-Degrade Cooldown (s)", str(settings.pacing_soft_degrade_cooldown_seconds))
-    growth_defaults.add_row("Pacing Auto-Clamp", "true" if settings.enable_pacing_auto_clamp else "false")
-    console.print(growth_defaults)
+    _render_client_health(_artifact_dict(artifact, "client_metrics"))
+
+
+def _render_status_generic(artifact: dict[str, Any]) -> None:
+    summary = _artifact_dict(artifact, "summary")
+    if summary:
+        _render_mapping_table(
+            title=f"{_format_metric_key(str(artifact.get('command', 'Run')))} Summary",
+            data={_format_metric_key(str(key)): value for key, value in summary.items() if value is not None},
+            key_column="Metric",
+            value_column="Value",
+        )
+    _render_client_health(_artifact_dict(artifact, "client_metrics"))
+
+
+def _render_status_error(artifact: dict[str, Any]) -> None:
+    error = artifact.get("error")
+    if not isinstance(error, dict) or not error:
+        return
+    error_table = Table(title="Last Error")
+    error_table.add_column("Field")
+    error_table.add_column("Value")
+    for key in ("type", "message", "reason", "task_name", "detail"):
+        value = error.get(key)
+        if value is not None:
+            error_table.add_row(_format_metric_key(key), str(value))
+    console.print(error_table)
+
+
+def _render_status(artifact: dict, *, artifact_path: Path, settings: AppSettings | None = None) -> None:
+    _ = settings
+    _render_status_header(artifact, artifact_path=artifact_path)
+    command = str(artifact.get("command") or "")
+    if command == "discover":
+        _render_status_discovery(artifact)
+    elif command == "run":
+        _render_status_growth(artifact)
+    elif command == "cleanup":
+        _render_status_cleanup(artifact)
+    else:
+        _render_status_generic(artifact)
+    _render_status_error(artifact)
 
 
 @app.command("version")
@@ -1309,6 +1463,11 @@ def auth_command(
         "--fallback-import/--no-fallback-import",
         help="Offer cookie-header import fallback when interactive browser auth fails.",
     ),
+    verify: bool = typer.Option(
+        True,
+        "--verify/--no-verify",
+        help="Run a read-only GraphQL check after saving captured auth material.",
+    ),
 ) -> None:
     """
     Open an interactive Playwright session for Medium login and capture session cookies.
@@ -1348,6 +1507,20 @@ def auth_command(
         upsert_env_file(env_path=env_path, material=material)
         _print_notice(f"Updated env file: {env_path}", level="success")
     _render_auth(material)
+    if verify:
+        verify_settings = (
+            _bootstrap_settings(env_path=env_path)
+            if write_env
+            else settings.model_copy(
+                update={
+                    "medium_session": material.medium_session,
+                    "medium_csrf": material.medium_csrf,
+                    "medium_user_ref": material.medium_user_ref,
+                }
+            )
+        )
+        if not _verify_auth_read(verify_settings):
+            raise typer.Exit(code=1)
 
 
 @app.command("auth-import")
@@ -1374,6 +1547,11 @@ def auth_import_command(
     ),
     write_env: bool = typer.Option(True, "--write-env/--no-write-env"),
     env_path: Path = typer.Option(Path(".env"), help="Destination `.env` file to update."),
+    verify: bool = typer.Option(
+        True,
+        "--verify/--no-verify",
+        help="Run a read-only GraphQL check after saving imported auth material.",
+    ),
 ) -> None:
     """
     Import auth session cookies from an already signed-in browser session.
@@ -1403,6 +1581,41 @@ def auth_import_command(
         upsert_env_file(env_path=env_path, material=material)
         _print_notice(f"Updated env file: {env_path}", level="success")
     _render_auth(material)
+    if verify:
+        verify_settings = (
+            _bootstrap_settings(env_path=env_path)
+            if write_env
+            else _bootstrap_settings().model_copy(
+                update={
+                    "medium_session": material.medium_session,
+                    "medium_csrf": material.medium_csrf,
+                    "medium_user_ref": material.medium_user_ref,
+                }
+            )
+        )
+        if not _verify_auth_read(verify_settings):
+            raise typer.Exit(code=1)
+
+
+@app.command("auth-check")
+def auth_check_command(
+    env_path: Path = typer.Option(Path(".env"), help="Environment file to inspect."),
+    read: bool = typer.Option(
+        True,
+        "--read/--no-read",
+        help="Execute a read-only GraphQL request to confirm the session works.",
+    ),
+) -> None:
+    """
+    Inspect configured auth material and optionally verify it with a read-only Medium request.
+    """
+    settings = _bootstrap_settings(env_path=env_path)
+    _render_auth_status(settings)
+    if not settings.has_session:
+        _print_notice("Auth is missing. Run `uv run bot auth` or `uv run bot auth-import`.", level="error")
+        raise typer.Exit(code=1)
+    if read and not _verify_auth_read(settings):
+        raise typer.Exit(code=1)
 
 
 @app.command("setup")
@@ -2034,120 +2247,62 @@ def _render_start_menu(
         level="success" if has_session else "warning",
     )
 
-    defaults = Table(title="Current Defaults")
-    defaults.add_column("Key")
-    defaults.add_column("Value")
-    defaults.add_row("Tag", tag_slug)
-    defaults.add_row("Seed Users", _seed_refs_summary(seed_user_refs))
-    defaults.add_row("Growth Policy", _format_growth_policy(growth_policy))
-    defaults.add_row("Growth Sources", _format_growth_sources(growth_sources))
-    defaults.add_row("Queue Ready", str(queue_ready_count))
-    defaults.add_row("Queue Deferred", str(queue_deferred_count))
-    defaults.add_row("Queue Rejected", str(queue_rejected_count))
-    defaults.add_row("Queue Followed", str(queue_followed_count))
-    defaults.add_row("Target-User Followers Scan Limit", str(target_user_followers_scan_limit))
-    defaults.add_row("Discovery Eligible / Run", str(discovery_eligible_per_run))
-    defaults.add_row("Growth Candidate DB Cap", str(growth_candidate_queue_max_size))
-    defaults.add_row("Follow Cooldown (h)", str(follow_cooldown_hours))
-    defaults.add_row(
-        "Candidate Followers Range",
-        f"{candidate_min_followers}-{candidate_max_followers if candidate_max_followers > 0 else 'unbounded'}",
-    )
-    defaults.add_row(
-        "Candidate Following Range",
-        f"{candidate_min_following}-{candidate_max_following if candidate_max_following > 0 else 'unbounded'}",
-    )
-    defaults.add_row("Max Following/Follower Ratio", str(max_following_follower_ratio))
-    defaults.add_row("Require Candidate Bio", "true" if require_candidate_bio else "false")
-    defaults.add_row("Require Candidate Latest Post", "true" if require_candidate_latest_post else "false")
-    defaults.add_row("Candidate Recent Activity (d)", str(candidate_recent_activity_days))
-    defaults.add_row("Discovery Followers Depth", str(discovery_followers_depth))
-    defaults.add_row("Discovery Seed Followers Limit", str(discovery_seed_followers_limit))
-    defaults.add_row("Discovery Second-Hop Seed Limit", str(discovery_second_hop_seed_limit))
-    defaults.add_row("Pre-Follow Clap", "true" if enable_pre_follow_clap else "false")
-    defaults.add_row("Pre-Follow Comment", "true" if enable_pre_follow_comment else "false")
-    defaults.add_row("Pre-Follow Comment Probability", str(round(pre_follow_comment_probability, 3)))
-    defaults.add_row("Pre-Follow Highlight", "true" if enable_pre_follow_highlight else "false")
-    defaults.add_row("Pre-Follow Highlight Probability", str(round(pre_follow_highlight_probability, 3)))
-    defaults.add_row(
-        "Pre-Follow Comment Templates",
-        str(len([item for item in pre_follow_comment_templates_raw.split("||") if item.strip()])),
-    )
-    defaults.add_row(
-        "Queue Buffer Target",
+    dashboard = Table(title="Operator Dashboard")
+    dashboard.add_column("Area")
+    dashboard.add_column("Current")
+    dashboard.add_row("Tag", tag_slug)
+    dashboard.add_row("Growth Policy", _format_growth_policy(growth_policy))
+    dashboard.add_row("Growth Sources", _format_growth_sources(growth_sources))
+    dashboard.add_row(
+        "Queue",
         (
-            f"min={growth_queue_buffer_target_min}, "
-            f"max={growth_queue_buffer_target_max}, "
-            f"x{growth_queue_buffer_target_multiplier}"
+            f"ready={queue_ready_count}, deferred={queue_deferred_count}, "
+            f"rejected={queue_rejected_count}, followed={queue_followed_count}"
         ),
     )
-    defaults.add_row(
-        "Queue Fetch Limit",
+    dashboard.add_row(
+        "Discovery",
         (
-            f"min={growth_queue_fetch_limit_min}, "
-            f"max={growth_queue_fetch_limit_max}, "
-            f"x{growth_queue_fetch_limit_multiplier}"
+            f"eligible/run={discovery_eligible_per_run}, "
+            f"cap={growth_candidate_queue_max_size}, "
+            f"target-scan={target_user_followers_scan_limit}"
         ),
     )
-    defaults.add_row(
-        "Queue Due Deferred Reserve",
-        str(round(growth_queue_due_deferred_reserve_ratio, 3)),
-    )
-    defaults.add_row(
-        "Queue Retry Started (s)",
+    dashboard.add_row(
+        "Live Session",
         (
-            f"floor={growth_queue_retry_started_floor_seconds}, "
-            f"x{growth_queue_retry_started_cooldown_multiplier}"
+            f"duration={live_session_minutes}m, "
+            f"target={live_session_target_follows}, "
+            f"min={live_session_min_follows}, "
+            f"passes={live_session_max_passes}"
         ),
     )
-    defaults.add_row(
-        "Queue Retry Short (s)",
-        f"floor={growth_queue_retry_short_floor_seconds}, x{growth_queue_retry_short_cooldown_multiplier}",
-    )
-    defaults.add_row(
-        "Queue Retry Medium (s)",
-        f"floor={growth_queue_retry_medium_floor_seconds}, x{growth_queue_retry_medium_cooldown_multiplier}",
-    )
-    defaults.add_row(
-        "Queue Retry Long (s)",
-        f"floor={growth_queue_retry_long_floor_seconds}, x{growth_queue_retry_long_cooldown_multiplier}",
-    )
-    defaults.add_row(
-        "Queue Prune TTL (d)",
+    dashboard.add_row(
+        "Safety Budgets",
         (
-            f"followed={growth_queue_prune_followed_after_days}, "
-            f"rejected={growth_queue_prune_rejected_after_days}, "
-            f"stale={growth_queue_prune_stale_after_days}"
+            f"follow/day={max_subscribe_actions_per_day}, "
+            f"follow/cycle={max_follow_actions_per_run}, "
+            f"comments/day={max_comment_actions_per_day}, "
+            f"mutations/10m={max_mutations_per_10_minutes}"
         ),
     )
-    defaults.add_row("Live Session Duration (m)", str(live_session_minutes))
-    defaults.add_row("Live Session Target Follows", str(live_session_target_follows))
-    defaults.add_row("Live Session Min Follows", str(live_session_min_follows))
-    defaults.add_row("Live Session Max Passes", str(live_session_max_passes))
-    defaults.add_row("Max Follow Actions Per Cycle", str(max_follow_actions_per_run))
-    defaults.add_row("Max Subscribe Actions Per Day", str(max_subscribe_actions_per_day))
-    defaults.add_row("Max Comment Actions Per Day", str(max_comment_actions_per_day))
-    defaults.add_row("Max Mutations / 10m", str(max_mutations_per_10_minutes))
-    defaults.add_row("Verify Gap (s)", f"{min_verify_gap_seconds}-{max_verify_gap_seconds}")
-    defaults.add_row("Pass Cooldown (s)", f"{pass_cooldown_min_seconds}-{pass_cooldown_max_seconds}")
-    defaults.add_row("Soft-Degrade Cooldown (s)", str(pacing_soft_degrade_cooldown_seconds))
-    defaults.add_row("Pacing Auto-Clamp", "true" if enable_pacing_auto_clamp else "false")
-    defaults.add_row("Graph Sync Auto", "true" if graph_sync_auto_enabled else "false")
-    defaults.add_row("Graph Sync Freshness (m)", str(graph_sync_freshness_window_minutes))
-    defaults.add_row("Graph Sync Full Pagination", "true" if graph_sync_full_pagination else "false")
-    defaults.add_row(
-        "GraphQL Following Source",
-        "true" if graph_sync_enable_graphql_following else "false",
+    dashboard.add_row(
+        "Pacing",
+        (
+            f"verify={min_verify_gap_seconds}-{max_verify_gap_seconds}s, "
+            f"pass={pass_cooldown_min_seconds}-{pass_cooldown_max_seconds}s, "
+            f"auto-clamp={'true' if enable_pacing_auto_clamp else 'false'}"
+        ),
     )
-    defaults.add_row("Scrape Following Fallback", "true" if graph_sync_enable_scrape_fallback else "false")
-    defaults.add_row("Graph Sync Scrape Timeout (s)", str(graph_sync_scrape_page_timeout_seconds))
-    defaults.add_row("Cleanup Limit", str(cleanup_unfollow_limit))
-    defaults.add_row("Cleanup Whitelist Followers >=", str(cleanup_whitelist_min_followers))
-    defaults.add_row("Reconcile Limit", str(reconcile_limit))
-    defaults.add_row("Reconcile Page Size", str(reconcile_page_size))
-    defaults.add_row("Newsletter Slug", newsletter_slug or "-")
-    defaults.add_row("Newsletter Username", newsletter_username or "-")
-    console.print(defaults)
+    dashboard.add_row(
+        "Maintenance",
+        (
+            f"sync-auto={'true' if graph_sync_auto_enabled else 'false'}, "
+            f"cleanup-limit={cleanup_unfollow_limit}, "
+            f"reconcile={reconcile_limit}/{reconcile_page_size}"
+        ),
+    )
+    console.print(dashboard)
 
     menu = Table(title="Start Menu", header_style="bold white")
     menu.add_column("Option", justify="right", style="bold cyan", no_wrap=True)
@@ -3649,8 +3804,23 @@ def _run_start_menu(
                     write_env=True,
                     env_path=Path(".env"),
                     login_url="https://medium.com/m/signin",
+                    fallback_import=True,
+                    verify=True,
                 ),
             ),
+            "4": (
+                "import auth cookies",
+                lambda: auth_import_command(
+                    cookie_header=None,
+                    cookie_file=None,
+                    medium_csrf=None,
+                    medium_user_ref=None,
+                    write_env=True,
+                    env_path=Path(".env"),
+                    verify=True,
+                ),
+            ),
+            "5": ("check auth session", lambda: auth_check_command(env_path=Path(".env"), read=True)),
         }
 
         if choice == "1":
@@ -4083,7 +4253,7 @@ def probe_command(
 
         if snapshot is not None:
             _render_probe(snapshot)
-        _print_notice(f"Run artifact saved: {artifact_path}", level="success")
+        _render_run_artifact_footer(artifact_path)
         if exit_code != 0:
             raise typer.Exit(code=exit_code)
     finally:
@@ -4218,7 +4388,7 @@ def contracts_command(
         )
         if report is not None:
             _render_contract_validation(report)
-        _print_notice(f"Run artifact saved: {artifact_path}", level="success")
+        _render_run_artifact_footer(artifact_path)
         if exit_code != 0:
             raise typer.Exit(code=exit_code)
     finally:
@@ -4416,8 +4586,9 @@ def discover_command(
         )
 
         if outcome is not None:
-            _render_daily_run(outcome)
-        _print_notice(f"Run artifact saved: {artifact_path}", level="success")
+            _render_discovery_report(outcome, tag_slug=tag_slug, artifact_path=artifact_path)
+        else:
+            _render_run_artifact_footer(artifact_path)
 
         if exit_code != 0:
             raise typer.Exit(code=exit_code)
@@ -4705,7 +4876,7 @@ def run_command(
         )
 
         if outcome is not None:
-            _render_daily_run(outcome)
+            _render_growth_report(outcome, tag_slug=tag_slug, artifact_path=artifact_path)
             queue_ready_before = outcome.kpis.get("growth_queue_ready_before_discovery")
             if (
                 isinstance(queue_ready_before, (int, float))
@@ -4716,7 +4887,8 @@ def run_command(
                     "Growth queue is empty. Run `uv run bot discover` first.",
                     level="warning",
                 )
-        _print_notice(f"Run artifact saved: {artifact_path}", level="success")
+        else:
+            _render_run_artifact_footer(artifact_path)
 
         if exit_code != 0:
             raise typer.Exit(code=exit_code)
@@ -4908,8 +5080,9 @@ def cleanup_command(
         )
 
         if outcome is not None:
-            _render_daily_run(outcome)
-        _print_notice(f"Run artifact saved: {artifact_path}", level="success")
+            _render_cleanup_report(outcome, limit=resolved_limit, artifact_path=artifact_path)
+        else:
+            _render_run_artifact_footer(artifact_path)
 
         if exit_code != 0:
             raise typer.Exit(code=exit_code)
@@ -5053,7 +5226,7 @@ def sync_command(
         )
         if outcome is not None:
             _render_graph_sync_outcome(outcome)
-        _print_notice(f"Run artifact saved: {artifact_path}", level="success")
+        _render_run_artifact_footer(artifact_path)
         if exit_code != 0:
             raise typer.Exit(code=exit_code)
     finally:
@@ -5214,7 +5387,7 @@ def reconcile_command(
         )
         if outcome is not None:
             _render_reconcile_outcome(outcome)
-        _print_notice(f"Run artifact saved: {artifact_path}", level="success")
+        _render_run_artifact_footer(artifact_path)
         if exit_code != 0:
             raise typer.Exit(code=exit_code)
     finally:
@@ -5282,7 +5455,7 @@ def status_command(
         run_id=run_id,
         payload=payload,
     )
-    _print_notice(f"Run artifact saved: {path}", level="success")
+    _render_run_artifact_footer(path)
 
 
 @artifacts_app.command("validate")
@@ -5354,7 +5527,7 @@ def artifacts_validate_command(
         run_id=run_id,
         payload=payload,
     )
-    _print_notice(f"Run artifact saved: {path}", level="success")
+    _render_run_artifact_footer(path)
 
 
 @growth_app.command("discover")

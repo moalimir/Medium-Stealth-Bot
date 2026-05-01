@@ -102,10 +102,11 @@ class PlaywrightGraphQLTransport:
 
     @staticmethod
     def _cookie_map_for_playwright(cookie_map: dict[str, str]) -> dict[str, str]:
-        # Challenge cookies are volatile and can become stale quickly. Let the
-        # browser profile own them instead of injecting from env/session strings.
-        drop_names = {"cf_clearance", "_cfuvid"}
-        return {name: value for name, value in cookie_map.items() if name not in drop_names}
+        # Auth import writes a complete Cookie header into MEDIUM_SESSION. Keep
+        # those cookies available to the persistent context so imported
+        # challenge/session material can be verified without a separate browser
+        # login.
+        return dict(cookie_map)
 
     async def open(self) -> None:
         if self._api_request is not None:
