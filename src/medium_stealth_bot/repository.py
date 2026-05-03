@@ -577,7 +577,7 @@ class ActionRepository:
             rows = connection.execute(query).fetchall()
             return {str(row["user_id"]) for row in rows if row["user_id"]}
 
-    def upsert_imported_follow_cycle_pending_from_following_cache(self) -> int:
+    def upsert_imported_follow_cycle_pending_from_following_cache(self, *, grace_days: int) -> int:
         query = """
         INSERT INTO follow_cycle (
             user_id,
@@ -591,9 +591,9 @@ class ActionRepository:
         SELECT
             c.user_id,
             c.username,
-            '',
+            CURRENT_TIMESTAMP,
             'imported_following_cache',
-            NULL,
+            datetime('now', 'utc', ?),
             'pending',
             CURRENT_TIMESTAMP
         FROM own_following_cache c
@@ -601,8 +601,32 @@ class ActionRepository:
             ON f.user_id = c.user_id
         WHERE f.user_id IS NULL
         """
+        modifier = f"+{grace_days} day"
         with self.database.connect() as connection:
-            connection.execute(query)
+            connection.execute(query, (modifier,))
+            row = connection.execute("SELECT changes() AS count").fetchone()
+            connection.commit()
+            if row is None:
+                return 0
+            return int(row["count"])
+
+    def repair_imported_follow_cycle_unknown_dates(self, *, grace_days: int) -> int:
+        query = """
+        UPDATE follow_cycle
+        SET followed_at = CURRENT_TIMESTAMP,
+            follow_deadline_at = datetime('now', 'utc', ?),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE follow_source = 'imported_following_cache'
+          AND cleanup_status = 'pending'
+          AND (
+              followed_at IS NULL
+              OR TRIM(COALESCE(followed_at, '')) = ''
+              OR datetime(followed_at) IS NULL
+          )
+        """
+        modifier = f"+{grace_days} day"
+        with self.database.connect() as connection:
+            connection.execute(query, (modifier,))
             row = connection.execute("SELECT changes() AS count").fetchone()
             connection.commit()
             if row is None:
@@ -1785,24 +1809,27 @@ class ActionRepository:
 
     def pending_nonreciprocal_candidates(self, *, grace_days: int, limit: int) -> list[dict[str, str | None]]:
         query = """
+        WITH pending AS (
+            SELECT
+                user_id,
+                username,
+                followed_at,
+                datetime(followed_at) AS effective_followed_at,
+                COALESCE(
+                    datetime(follow_deadline_at),
+                    datetime(followed_at, ?)
+                ) AS effective_deadline_at
+            FROM follow_cycle
+            WHERE cleanup_status = 'pending'
+        )
         SELECT user_id, username, followed_at
-        FROM follow_cycle
-        WHERE cleanup_status = 'pending'
-          AND (
-              followed_at IS NULL
-              OR TRIM(COALESCE(followed_at, '')) = ''
-              OR datetime(followed_at) IS NULL
-              OR COALESCE(
-                  datetime(follow_deadline_at),
-                  datetime(followed_at, ?)
-              ) <= datetime('now', 'utc')
-          )
+        FROM pending
+        WHERE effective_followed_at IS NOT NULL
+          AND effective_deadline_at IS NOT NULL
+          AND effective_deadline_at <= datetime('now', 'utc')
         ORDER BY
-          CASE
-              WHEN followed_at IS NULL OR TRIM(COALESCE(followed_at, '')) = '' OR datetime(followed_at) IS NULL THEN 0
-              ELSE 1
-          END ASC,
-          datetime(followed_at) ASC
+          effective_deadline_at ASC,
+          effective_followed_at ASC
         LIMIT ?
         """
         fallback_deadline_modifier = f"+{grace_days} day"

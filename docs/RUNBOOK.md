@@ -168,7 +168,10 @@ uv run bot reconcile --dry-run --limit 200 --page-size 50
 ```bash
 uv run bot cleanup --dry-run --limit 50
 uv run bot cleanup --live --limit 50
+uv run bot cleanup --live --limit 50 --rollback-engagement
 ```
+
+Cleanup unfollows only by default. The `--rollback-engagement` flag opts into removing prior claps, comments, and highlights after a verified cleanup unfollow. The interactive start menu exposes the same behavior under `Unfollow` -> `Live + Engagement Rollback` and asks for confirmation before running it.
 
 ### DB hygiene
 

@@ -207,6 +207,8 @@ Output: follow/clap/comment execution against queued candidates.
 - uses cache-first filtering
 - respects whitelist thresholds for high-follower accounts
 - uses separate cleanup pacing
+- gives imported unknown-date following-cache rows a full grace window before eligibility
+- keeps prior claps, comments, and highlights unless engagement rollback is explicitly enabled
 
 ### DB hygiene (`bot db-hygiene`)
 

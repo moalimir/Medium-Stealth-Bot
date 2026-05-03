@@ -77,7 +77,7 @@ _NOTICE_PREFIX = {
 _START_MENU_SECTIONS: tuple[tuple[str, str, str], ...] = (
     ("1", "Discovery", "Discover, score, evaluate, and queue growth candidates."),
     ("2", "Growth", "Execute follow growth from execution-ready queue."),
-    ("3", "Unfollow", "Run cleanup-only unfollow workflows."),
+    ("3", "Unfollow", "Run cleanup unfollow and optional engagement rollback workflows."),
     ("4", "Maintenance", "Reconcile and sync local social graph state."),
     ("5", "Diagnostics", "Probe Medium reads and validate contracts."),
     ("6", "Observability", "Inspect the latest run status and queue/artifacts."),
@@ -139,9 +139,10 @@ _GROWTH_RUNTIME_MENU_OPTIONS: tuple[tuple[str, str, str], ...] = (
 )
 
 _UNFOLLOW_MENU_OPTIONS: tuple[tuple[str, str, str], ...] = (
-    ("1", "Live", "Run cleanup-only unfollow"),
-    ("2", "Dry-run", "Preview cleanup-only unfollow"),
-    ("3", "Back", "Return to the start sections"),
+    ("1", "Live (Keep Engagement)", "Unfollow overdue non-followbacks only."),
+    ("2", "Live + Engagement Rollback", "Unfollow, then remove prior claps/comments/highlights."),
+    ("3", "Dry-run", "Preview cleanup decisions without unfollowing."),
+    ("4", "Back", "Return to the start sections"),
 )
 
 _MAINTENANCE_MENU_OPTIONS: tuple[tuple[str, str, str], ...] = (
@@ -952,6 +953,7 @@ def _render_graph_sync_outcome(outcome: GraphSyncOutcome) -> None:
     table.add_row("Skipped", "true" if outcome.skipped else "false")
     if outcome.skipped:
         table.add_row("Skip Reason", outcome.skip_reason or "-")
+    table.add_row("Cache Persisted", "true" if outcome.cache_persisted else "false")
     table.add_row("Run ID", str(outcome.run_id or "-"))
     table.add_row("Followers Synced", str(outcome.followers_count))
     table.add_row("Following Synced", str(outcome.following_count))
@@ -3720,22 +3722,35 @@ def _run_start_menu(
             seed_user_refs = refs
             return refs
 
+        def _run_cleanup_from_menu(*, live: bool, rollback_engagement: bool) -> None:
+            if rollback_engagement:
+                confirmed = typer.confirm(
+                    "Engagement rollback can undo prior claps and delete prior comments/highlights "
+                    "after verified unfollows. Continue?",
+                    default=False,
+                )
+                if not confirmed:
+                    _print_notice("Cleanup with engagement rollback cancelled.", level="warning")
+                    return
+            cleanup_command(
+                live=live,
+                limit=_prompt_cleanup_run_limit(),
+                auto_sync=graph_sync_auto_enabled,
+                rollback_engagement=rollback_engagement,
+            )
+
         unfollow_actions: dict[str, tuple[str, Callable[[], None]]] = {
             "1": (
-                "cleanup-only unfollow (live)",
-                lambda: cleanup_command(
-                    live=True,
-                    limit=_prompt_cleanup_run_limit(),
-                    auto_sync=graph_sync_auto_enabled,
-                ),
+                "cleanup unfollow keeping engagement (live)",
+                lambda: _run_cleanup_from_menu(live=True, rollback_engagement=False),
             ),
             "2": (
+                "cleanup unfollow with engagement rollback (live)",
+                lambda: _run_cleanup_from_menu(live=True, rollback_engagement=True),
+            ),
+            "3": (
                 "cleanup-only unfollow (dry-run)",
-                lambda: cleanup_command(
-                    live=False,
-                    limit=_prompt_cleanup_run_limit(),
-                    auto_sync=graph_sync_auto_enabled,
-                ),
+                lambda: _run_cleanup_from_menu(live=False, rollback_engagement=False),
             ),
         }
 
@@ -4534,6 +4549,7 @@ def discover_command(
                 outcome.kpis["graph_sync_following_count"] = sync_outcome.following_count
                 outcome.kpis["graph_sync_users_upserted_count"] = sync_outcome.users_upserted_count
                 outcome.kpis["graph_sync_imported_pending_count"] = sync_outcome.imported_pending_count
+                outcome.kpis["graph_sync_cache_persisted"] = 1 if sync_outcome.cache_persisted else 0
         except RiskHaltError as exc:
             status = "halted"
             exit_code = _risk_halt_exit_code(settings)
@@ -4824,6 +4840,7 @@ def run_command(
                 outcome.kpis["graph_sync_following_count"] = sync_outcome.following_count
                 outcome.kpis["graph_sync_users_upserted_count"] = sync_outcome.users_upserted_count
                 outcome.kpis["graph_sync_imported_pending_count"] = sync_outcome.imported_pending_count
+                outcome.kpis["graph_sync_cache_persisted"] = 1 if sync_outcome.cache_persisted else 0
         except RiskHaltError as exc:
             status = "halted"
             exit_code = _risk_halt_exit_code(settings)
@@ -4966,6 +4983,14 @@ def cleanup_command(
         "--auto-sync/--no-auto-sync",
         help="Refresh local social-graph cache before cleanup execution.",
     ),
+    rollback_engagement: bool | None = typer.Option(
+        None,
+        "--rollback-engagement/--keep-engagement",
+        help=(
+            "After verified cleanup unfollows, optionally undo prior claps and delete prior "
+            "comments/highlights. Defaults to CLEANUP_ROLLBACK_ENGAGEMENT_ENABLED."
+        ),
+    ),
 ) -> None:
     """
     Run cleanup-only unfollow maintenance for overdue non-followback users.
@@ -4989,9 +5014,16 @@ def cleanup_command(
     sync_outcome: GraphSyncOutcome | None = None
     runtime_client_metrics: dict[str, Any] = {}
     resolved_limit = limit if limit is not None else settings.cleanup_unfollow_limit
+    resolved_rollback_engagement = (
+        settings.cleanup_rollback_engagement_enabled
+        if rollback_engagement is None
+        else rollback_engagement
+    )
     mode_label = "live" if live else "dry-run"
     _print_notice(
-        f"Starting cleanup-only run `{run_id}` (mode={mode_label}, limit={resolved_limit}).",
+        f"Starting cleanup-only run `{run_id}` "
+        f"(mode={mode_label}, limit={resolved_limit}, "
+        f"rollback_engagement={str(resolved_rollback_engagement).lower()}).",
         level="info",
     )
 
@@ -5010,6 +5042,8 @@ def cleanup_command(
                                 dry_run=not live,
                                 mode="auto",
                                 force=False,
+                                persist_cache=True,
+                                import_follow_cycle_pending=live,
                             )
                             if not sync_outcome_local.skipped:
                                 _render_graph_sync_outcome(sync_outcome_local)
@@ -5017,6 +5051,7 @@ def cleanup_command(
                         return await runner.run_cleanup_only(
                             dry_run=not live,
                             max_unfollows=resolved_limit,
+                            rollback_engagement=resolved_rollback_engagement,
                         )
                     finally:
                         runtime_client_metrics = client.metrics_snapshot()
@@ -5028,6 +5063,7 @@ def cleanup_command(
                 outcome.kpis["graph_sync_following_count"] = sync_outcome.following_count
                 outcome.kpis["graph_sync_users_upserted_count"] = sync_outcome.users_upserted_count
                 outcome.kpis["graph_sync_imported_pending_count"] = sync_outcome.imported_pending_count
+                outcome.kpis["graph_sync_cache_persisted"] = 1 if sync_outcome.cache_persisted else 0
         except RiskHaltError as exc:
             status = "halted"
             exit_code = _risk_halt_exit_code(settings)
@@ -5148,6 +5184,8 @@ def sync_command(
                             dry_run=not live,
                             mode="manual",
                             force=force,
+                            persist_cache=True,
+                            import_follow_cycle_pending=live,
                         )
                     finally:
                         runtime_client_metrics = client.metrics_snapshot()
@@ -5184,6 +5222,7 @@ def sync_command(
                 "following_count": outcome.following_count,
                 "users_upserted_count": outcome.users_upserted_count,
                 "imported_pending_count": outcome.imported_pending_count,
+                "cache_persisted": outcome.cache_persisted,
                 "duration_ms": outcome.duration_ms,
                 "following_source": outcome.used_following_source or "-",
             }
@@ -5193,6 +5232,7 @@ def sync_command(
                 "graph_sync_following_count": outcome.following_count,
                 "graph_sync_users_upserted_count": outcome.users_upserted_count,
                 "graph_sync_imported_pending_count": outcome.imported_pending_count,
+                "graph_sync_cache_persisted": 1 if outcome.cache_persisted else 0,
             }
         artifact_payload = _build_standard_artifact_payload(
             run_id=run_id,
@@ -5355,6 +5395,7 @@ def reconcile_command(
             kpis["graph_sync_following_count"] = sync_outcome.following_count
             kpis["graph_sync_users_upserted_count"] = sync_outcome.users_upserted_count
             kpis["graph_sync_imported_pending_count"] = sync_outcome.imported_pending_count
+            kpis["graph_sync_cache_persisted"] = 1 if sync_outcome.cache_persisted else 0
         artifact_payload = _build_standard_artifact_payload(
             run_id=run_id,
             command="reconcile",
@@ -5835,11 +5876,24 @@ def unfollow_cleanup_command(
         "--auto-sync/--no-auto-sync",
         help="Refresh local social-graph cache before cleanup execution.",
     ),
+    rollback_engagement: bool | None = typer.Option(
+        None,
+        "--rollback-engagement/--keep-engagement",
+        help=(
+            "After verified cleanup unfollows, optionally undo prior claps and delete prior "
+            "comments/highlights. Defaults to CLEANUP_ROLLBACK_ENGAGEMENT_ENABLED."
+        ),
+    ),
 ) -> None:
     """
     Run cleanup-only unfollow maintenance for overdue non-followback users.
     """
-    cleanup_command(live=live, limit=limit, auto_sync=auto_sync)
+    cleanup_command(
+        live=live,
+        limit=limit,
+        auto_sync=auto_sync,
+        rollback_engagement=rollback_engagement,
+    )
 
 
 @maintenance_app.command("reconcile")

@@ -491,6 +491,10 @@ class AppSettings(BaseSettings):
         ge=0,
         validation_alias="CLEANUP_UNFOLLOW_MAX_GAP_SECONDS",
     )
+    cleanup_rollback_engagement_enabled: bool = Field(
+        default=False,
+        validation_alias="CLEANUP_ROLLBACK_ENGAGEMENT_ENABLED",
+    )
     own_followers_scan_limit: int = Field(default=80, ge=1, le=500, validation_alias="OWN_FOLLOWERS_SCAN_LIMIT")
 
     enable_pre_follow_clap: bool = Field(default=True, validation_alias="ENABLE_PRE_FOLLOW_CLAP")

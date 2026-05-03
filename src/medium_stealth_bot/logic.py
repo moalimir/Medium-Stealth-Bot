@@ -246,6 +246,8 @@ class DailyRunner:
         dry_run: bool,
         mode: str = "auto",
         force: bool = False,
+        persist_cache: bool | None = None,
+        import_follow_cycle_pending: bool | None = None,
     ) -> GraphSyncOutcome:
         self._assert_operator_not_stopped(task_name="sync_social_graph")
         service = GraphSyncService(
@@ -257,6 +259,8 @@ class DailyRunner:
             dry_run=dry_run,
             mode=mode,
             force=force,
+            persist_cache=persist_cache,
+            import_follow_cycle_pending=import_follow_cycle_pending,
         )
 
     def _daily_action_limits(self) -> dict[str, int]:
@@ -1301,12 +1305,18 @@ class DailyRunner:
         *,
         dry_run: bool = True,
         max_unfollows: int | None = None,
+        rollback_engagement: bool | None = None,
     ) -> DailyRunOutcome:
         self._assert_operator_not_stopped(task_name="run_cleanup_only")
         await self._maybe_recover_stealth_preflight_challenge(dry_run=dry_run)
         self.timing.reset_session_state()
         self.timing.reset_metrics()
         self.timing.set_simulation_mode(dry_run)
+        resolved_rollback_engagement = (
+            self.settings.cleanup_rollback_engagement_enabled
+            if rollback_engagement is None
+            else rollback_engagement
+        )
 
         actions_today_start = self.repository.actions_today_utc(TRACKED_DAILY_ACTION_TYPES)
         max_actions = self.settings.max_actions_per_day
@@ -1349,10 +1359,16 @@ class DailyRunner:
         if not mutations_enabled and not dry_run:
             cleanup_cap = 0
 
+        if not dry_run:
+            self.repository.repair_imported_follow_cycle_unknown_dates(
+                grace_days=self.settings.unfollow_nonreciprocal_after_days,
+            )
+
         cleanup_attempted, cleanup_verified = await self._execute_cleanup_pipeline(
             dry_run=dry_run,
             max_to_run=cleanup_cap,
             decisions=decisions,
+            rollback_engagement=resolved_rollback_engagement,
         )
         action_counts[ACTION_UNFOLLOW] += cleanup_attempted
         action_remaining[ACTION_UNFOLLOW] = max(0, action_limits[ACTION_UNFOLLOW] - action_counts[ACTION_UNFOLLOW])
@@ -1379,6 +1395,7 @@ class DailyRunner:
         kpis.update(self.repository.follow_cycle_kpis())
         kpis.update(self.timing.metrics_snapshot())
         kpis["pacing_mutations_enabled"] = 1 if mutations_enabled else 0
+        kpis["cleanup_rollback_engagement_enabled"] = 1 if resolved_rollback_engagement else 0
         client_metrics = self.client.metrics_snapshot()
 
         self.log.info(
@@ -1392,6 +1409,7 @@ class DailyRunner:
             action_limits=action_limits,
             action_remaining=action_remaining,
             mutations_enabled=mutations_enabled,
+            rollback_engagement=resolved_rollback_engagement,
             decision_reason_counts=decision_reason_counts,
             decision_result_counts=decision_result_counts,
             kpis=kpis,
@@ -4199,11 +4217,11 @@ class DailyRunner:
         dry_run: bool,
         max_to_run: int,
         decisions: list[CandidateDecision],
+        rollback_engagement: bool,
     ) -> tuple[int, int]:
         if max_to_run <= 0:
             return 0, 0
 
-        self.repository.upsert_imported_follow_cycle_pending_from_following_cache()
         due_pool = self.repository.pending_nonreciprocal_candidates(
             grace_days=self.settings.unfollow_nonreciprocal_after_days,
             limit=max(max_to_run, max_to_run * 5),
@@ -4281,6 +4299,7 @@ class DailyRunner:
                 )
                 continue
 
+            profile_result: GraphQLResult | None = None
             whitelist_min_followers = max(0, self.settings.cleanup_unfollow_whitelist_min_followers)
             if whitelist_min_followers > 0:
                 profile_result = await self._execute_with_retry(
@@ -4306,8 +4325,8 @@ class DailyRunner:
                     )
                     continue
 
-            attempted += 1
             if dry_run:
+                attempted += 1
                 await self._sleep_action_gap(
                     action_type=ACTION_UNFOLLOW,
                     target_user_id=user_id,
@@ -4324,6 +4343,45 @@ class DailyRunner:
                 )
                 continue
 
+            if profile_result is None:
+                profile_result = await self._execute_with_retry(
+                    "cleanup_pre_unfollow_verify",
+                    operations.user_viewer_edge(user_id),
+                )
+            pre_is_following = parse_user_viewer_is_following(profile_result)
+            if pre_is_following is False:
+                self.repository.mark_cleanup_skipped(user_id)
+                self.repository.upsert_relationship_state(
+                    user_id,
+                    newsletter_state=NewsletterState.UNKNOWN,
+                    user_follow_state=UserFollowState.NOT_FOLLOWING,
+                    confidence=RelationshipConfidence.OBSERVED,
+                    source_operation="UserViewerEdge",
+                    verified_now=True,
+                )
+                self.repository.mark_candidate_reconciled(user_id, UserFollowState.NOT_FOLLOWING)
+                decisions.append(
+                    CandidateDecision(
+                        user_id=user_id,
+                        username=username,
+                        eligible=False,
+                        reason="cleanup:preverify_not_following",
+                    )
+                )
+                continue
+            if pre_is_following is not True:
+                self.repository.mark_cleanup_checked(user_id)
+                decisions.append(
+                    CandidateDecision(
+                        user_id=user_id,
+                        username=username,
+                        eligible=False,
+                        reason="cleanup:preverify_uncertain",
+                    )
+                )
+                continue
+
+            attempted += 1
             await self._sleep_action_gap(
                 action_type=ACTION_UNFOLLOW,
                 target_user_id=user_id,
@@ -4370,7 +4428,8 @@ class DailyRunner:
                     verified_now=True,
                 )
                 self.repository.mark_candidate_reconciled(user_id, UserFollowState.NOT_FOLLOWING)
-                await self._rollback_public_engagement(user_id=user_id)
+                if rollback_engagement:
+                    await self._rollback_public_engagement(user_id=user_id)
                 decisions.append(
                     CandidateDecision(
                         user_id=user_id,

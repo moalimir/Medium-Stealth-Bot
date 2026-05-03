@@ -70,8 +70,18 @@ class GraphSyncService:
         dry_run: bool,
         mode: str,
         force: bool = False,
+        persist_cache: bool | None = None,
+        import_follow_cycle_pending: bool | None = None,
     ) -> GraphSyncOutcome:
         started = time.perf_counter()
+        resolved_persist_cache = (not dry_run) if persist_cache is None else persist_cache
+        resolved_import_pending = (
+            resolved_persist_cache and not dry_run
+            if import_follow_cycle_pending is None
+            else import_follow_cycle_pending
+        )
+        if resolved_import_pending and not resolved_persist_cache:
+            raise ValueError("import_follow_cycle_pending requires persist_cache=True")
 
         if mode == "auto" and not self.settings.graph_sync_auto_enabled and not force:
             return GraphSyncOutcome(
@@ -89,7 +99,7 @@ class GraphSyncService:
                 skip_reason="fresh_cache_window",
             )
 
-        run_id = None if dry_run else self.repository.begin_graph_sync_run(
+        run_id = None if not resolved_persist_cache else self.repository.begin_graph_sync_run(
             mode=mode,
             source_path=str(self.settings.implementation_ops_registry_path),
         )
@@ -104,18 +114,24 @@ class GraphSyncService:
 
         try:
             followers_rows, followers_source = await self._fetch_followers_rows()
-            if dry_run:
+            if not resolved_persist_cache:
                 followers_count = len(followers_rows)
             else:
                 followers_count = self.repository.replace_own_followers_snapshot(followers_rows, run_id=run_id)
 
             following_rows, following_source = await self._fetch_following_rows()
-            if dry_run:
+            if not resolved_persist_cache:
                 following_count = len(following_rows)
             else:
                 following_count = self.repository.replace_own_following_snapshot(following_rows, run_id=run_id)
                 users_upserted_count = self.repository.upsert_users_from_social_caches()
-                imported_pending_count = self.repository.upsert_imported_follow_cycle_pending_from_following_cache()
+                if resolved_import_pending:
+                    self.repository.repair_imported_follow_cycle_unknown_dates(
+                        grace_days=self.settings.unfollow_nonreciprocal_after_days,
+                    )
+                    imported_pending_count = self.repository.upsert_imported_follow_cycle_pending_from_following_cache(
+                        grace_days=self.settings.unfollow_nonreciprocal_after_days,
+                    )
         except Exception as exc:  # noqa: BLE001
             status = "failed"
             error_message = str(exc)
@@ -148,6 +164,8 @@ class GraphSyncService:
             users_upserted_count=users_upserted_count,
             imported_pending_count=imported_pending_count,
             following_source=following_source,
+            cache_persisted=resolved_persist_cache,
+            import_follow_cycle_pending=resolved_import_pending,
             duration_ms=duration_ms,
         )
         return GraphSyncOutcome(
@@ -155,6 +173,7 @@ class GraphSyncService:
             mode=mode,
             run_id=run_id,
             skipped=False,
+            cache_persisted=resolved_persist_cache,
             followers_count=followers_count,
             following_count=following_count,
             users_upserted_count=users_upserted_count,

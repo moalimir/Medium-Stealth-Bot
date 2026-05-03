@@ -84,7 +84,7 @@ Choose your engagement style:
 
 ### Intelligent Maintenance
 
-- **Cleanup-only unfollow:** remove non-reciprocal follows after configurable windows
+- **Cleanup-only unfollow:** remove non-reciprocal follows after configurable windows; imported unknown-date follows receive a fresh grace window before eligibility
 - **Graph sync:** keep local follow-state aligned with Medium
 - **Reconciliation:** verify ambiguous follow states before relying on them
 - **DB hygiene:** prune stale operational data with retention windows
@@ -93,6 +93,7 @@ Choose your engagement style:
 
 - **Local-only operation:** auth, queue, and artifacts stay on your machine
 - **Explicit dry-run modes:** preview actions before going live
+- **Cleanup previews:** cleanup dry-runs may refresh the local graph cache for accurate decisions without writing follow-cycle or action-log rows
 - **UTC day-boundary budgets:** enforce daily action caps for follows, claps, comments, highlights, and unfollows
 - **Live state verification:** re-check follow state immediately before mutation
 - **Claim-safe execution:** candidates are atomically claimed before live execution
@@ -204,6 +205,7 @@ uv run bot growth session --policy warm-engage --session-minutes 90 --target-fol
 uv run bot sync --live --force
 uv run bot reconcile --dry-run --limit 200 --page-size 50
 uv run bot cleanup --dry-run --limit 50
+uv run bot cleanup --live --limit 50 --rollback-engagement
 uv run bot maintenance db-hygiene --dry-run
 ```
 

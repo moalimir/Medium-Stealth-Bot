@@ -145,6 +145,7 @@ class GraphSyncOutcome(BaseModel):
     run_id: int | None = None
     skipped: bool = False
     skip_reason: str | None = None
+    cache_persisted: bool = False
     followers_count: int = 0
     following_count: int = 0
     users_upserted_count: int = 0
