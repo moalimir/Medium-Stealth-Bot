@@ -41,7 +41,7 @@ The core principle is simple: you control the automation. Auth, queue data, brow
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/moalimirinfinity/Medium-Stealth-Bot.git
+git clone https://github.com/moalimir/Medium-Stealth-Bot.git
 cd Medium-Stealth-Bot
 
 # 2. Install dependencies
